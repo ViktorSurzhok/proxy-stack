@@ -3,6 +3,7 @@
 ## Платформа
 
 - Официально ориентир: **Ubuntu / Debian** с `systemd`, `apt`, поддержкой UFW.
+- На минимальных образах Ubuntu пакет **`docker-compose-plugin`** иногда отсутствует в apt. Установщик тогда подтягивает **Docker Compose v2** с [релизов docker/compose](https://github.com/docker/compose/releases) в `/usr/local/lib/docker/cli-plugins/` (версию можно переопределить переменной `DOCKER_COMPOSE_PLUGIN_VERSION`).
 - Образ **MTProto** с Docker Hub ориентирован преимущественно на **amd64**. На **ARM** (Graviton, Raspberry Pi VPS) `docker pull` может не найти подходящий манифест — потребуется другой образ или сборка из исходников.
 
 ## Сеть и IP
