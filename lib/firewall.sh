@@ -12,10 +12,14 @@ ufw_ensure_installed() {
 }
 
 # Удаляет только правила с подстрокой "proxy-stack svc=" в комментарии (см. ufw status numbered).
+# Важно: при set -o pipefail grep без совпадений даёт код 1 — нельзя вставлять такой pipeline в $(...) без проверки.
 ufw_delete_proxy_stack_rules() {
   local out num
   while true; do
     out="$(ufw status numbered 2>/dev/null || true)"
+    if ! echo "$out" | grep -q 'proxy-stack svc='; then
+      break
+    fi
     num="$(echo "$out" | grep 'proxy-stack svc=' | sed -n 's/^\[[[:space:]]*\([0-9]\+\)\].*/\1/p' | sort -rn | head -1)"
     [[ -z "$num" ]] && break
     echo "y" | ufw delete "$num" >/dev/null 2>&1 || break
