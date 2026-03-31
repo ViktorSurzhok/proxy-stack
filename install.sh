@@ -1,281 +1,226 @@
-#!/bin/bash
-# ============================================================
-#  proxy-stack install.sh
-#  Поднимает: SOCKS5 (Dante) + HTTP (Tinyproxy) + Outline VPN
-#  Запуск: sudo bash install.sh
-#  Или одной командой:
-#    bash -c "$(curl -fsSL https://raw.githubusercontent.com/ViktorSurzhok/proxy-stack/main/install.sh)"
-# ============================================================
+#!/usr/bin/env bash
+# =============================================================================
+# proxy-stack — установка Tinyproxy (HTTP) + MTProto (Telegram) + UFW
+# Запуск: git clone … && cd … && sudo ./install.sh
+# Требования: Ubuntu/Debian, root, чистые или заранее проверенные порты.
+# Bash: set -Eeuo pipefail, комментарии для сопровождения.
+# =============================================================================
+set -Eeuo pipefail
 
-set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ─── Цвета ───────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=lib/firewall.sh
+source "$SCRIPT_DIR/lib/firewall.sh"
+# shellcheck source=lib/tinyproxy.sh
+source "$SCRIPT_DIR/lib/tinyproxy.sh"
+# shellcheck source=lib/mtproto.sh
+source "$SCRIPT_DIR/lib/mtproto.sh"
+# shellcheck source=lib/verify.sh
+source "$SCRIPT_DIR/lib/verify.sh"
 
-log()  { echo -e "${GREEN}[✓]${NC} $1"; }
-info() { echo -e "${CYAN}[i]${NC} $1"; }
-warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-die()  { echo -e "${RED}[✗] ОШИБКА: $1${NC}"; exit 1; }
+# --- Переменные окружения (опционально) --------------------------------------
+# TINYPROXY_PORT=8888
+# MTPROTO_PORT=443
+# ALLOWED_IPS="1.2.3.4,5.6.7.8"   # IP, с которых разрешён HTTP-прокси (рекомендуется)
+# TINYPROXY_BASIC_AUTH_USER / TINYPROXY_BASIC_AUTH_PASS — опционально (см. README)
+# CONFIRM_OPEN_PROXY=I_UNDERSTAND_OPEN_PROXY_RISK — «открытый» Tinyproxy (не рекомендуется)
+# STATE_DIR=/opt/proxy-stack
 
-# ─── Параметры (можно переопределить переменными окружения) ───
-SOCKS_PORT="${SOCKS_PORT:-1080}"
-HTTP_PORT="${HTTP_PORT:-8888}"
-SOCKS_USER="${SOCKS_USER:-proxyuser}"
-SOCKS_PASS="${SOCKS_PASS:-$(tr -dc 'A-Za-z0-9!@#$' </dev/urandom | head -c 16)}"
-INSTALL_DIR="${INSTALL_DIR:-/opt/proxy-stack}"
-OUTLINE_DIR="${OUTLINE_DIR:-/opt/outline}"
+trap 'echo -e "${RED}[xx]${NC} Прервано или ошибка (строка ${LINENO}, статус $?). См. ${INSTALL_LOG:-лог}." >&2' ERR
 
-# ─── Проверки ────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && die "Запусти скрипт от root: sudo bash install.sh"
+usage() {
+  cat <<EOF
+Использование: sudo ./install.sh
 
-OS=$(lsb_release -si 2>/dev/null || cat /etc/os-release | grep ^ID= | cut -d= -f2)
-[[ "$OS" != "Ubuntu" && "$OS" != "Debian" && "$OS" != "ubuntu" && "$OS" != "debian" ]] && \
-    warn "Протестировано на Ubuntu/Debian. Продолжаем на свой страх и риск..."
+Перед запуском задайте при необходимости ALLOWED_IPS (через запятую) — IP для доступа к Tinyproxy.
+Если вы вошли по SSH, по умолчанию подставится IP клиента SSH.
+EOF
+}
 
-# ─── Определяем сетевой интерфейс и IP ───────────────────────
-IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-SERVER_IP=$(curl -s --max-time 5 https://ifconfig.me || curl -s --max-time 5 https://api.ipify.org)
-[[ -z "$SERVER_IP" ]] && SERVER_IP=$(hostname -I | awk '{print $1}')
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
 
-info "Интерфейс: $IFACE | IP: $SERVER_IP"
+require_root
+assert_supported_os
 
-# ─── Создаём рабочую директорию ──────────────────────────────
-mkdir -p "$INSTALL_DIR"
-cd "$INSTALL_DIR"
+ensure_state_dir
+append_install_log_header
+exec > >(tee -a "$INSTALL_LOG") 2>&1
 
-echo ""
-echo -e "${BOLD}══════════════════════════════════════════${NC}"
-echo -e "${BOLD}   proxy-stack installer                  ${NC}"
-echo -e "${BOLD}══════════════════════════════════════════${NC}"
-echo ""
+info "proxy-stack install, STATE_DIR=$STATE_DIR"
 
-# ════════════════════════════════════════════
-# 1. СИСТЕМНЫЕ ЗАВИСИМОСТИ
-# ════════════════════════════════════════════
-info "Обновляем пакеты..."
+DEFAULT_IFACE="$(detect_default_iface || true)"
+SERVER_PUBLIC_IP="$(detect_public_ipv4)"
+SSH_CLIENT_IP="$(detect_ssh_client_ip || true)"
+
+info "Публичный IPv4 сервера: $SERVER_PUBLIC_IP (интерфейс по умолчанию: ${DEFAULT_IFACE:-unknown})"
+
+# --- Разбор ALLOWED_IPS ------------------------------------------------------
+declare -a ALLOW_IP_LIST=()
+if [[ -n "${ALLOWED_IPS:-}" ]]; then
+  IFS=',' read -ra _parts <<<"${ALLOWED_IPS// /}"
+  for x in "${_parts[@]}"; do
+    [[ -n "$x" ]] && ALLOW_IP_LIST+=("$x")
+  done
+fi
+if [[ ${#ALLOW_IP_LIST[@]} -eq 0 && -n "${SSH_CLIENT_IP:-}" ]]; then
+  ALLOW_IP_LIST+=("$SSH_CLIENT_IP")
+  info "ALLOWED_IPS не задан — используем IP SSH-клиента: $SSH_CLIENT_IP"
+fi
+
+ACCESS_MODE="allowed_ips"
+if [[ "${CONFIRM_OPEN_PROXY:-}" == "I_UNDERSTAND_OPEN_PROXY_RISK" ]]; then
+  ACCESS_MODE="open_warning"
+  warn "Включён режим открытого Tinyproxy (Allow 0.0.0.0/0 + UFW world). Это риск open proxy."
+elif [[ -n "${TINYPROXY_BASIC_AUTH_USER:-}" || -n "${TINYPROXY_BASIC_AUTH_PASS:-}" ]]; then
+  if [[ -z "${TINYPROXY_BASIC_AUTH_USER:-}" || -z "${TINYPROXY_BASIC_AUTH_PASS:-}" ]]; then
+    die "Задайте оба: TINYPROXY_BASIC_AUTH_USER и TINYPROXY_BASIC_AUTH_PASS"
+  fi
+  ACCESS_MODE="basic_auth"
+  [[ ${#ALLOW_IP_LIST[@]} -gt 0 ]] || die "С BasicAuth всё равно задайте ALLOWED_IPS (или SSH) — не открываем 0.0.0.0/0 без явного OPEN."
+elif [[ ${#ALLOW_IP_LIST[@]} -eq 0 ]]; then
+  die "Не удалось определить IP для Tinyproxy. Запустите: ALLOWED_IPS=ваш.публичный.ip sudo ./install.sh"
+fi
+
+# --- Порты: конфликты --------------------------------------------------------
+if tcp_port_in_use "$TINYPROXY_PORT"; then
+  port_free_or_owned_by "$TINYPROXY_PORT" "tinyproxy" || die "Порт $TINYPROXY_PORT уже занят (Tinyproxy). Задайте TINYPROXY_PORT=другой"
+fi
+
+if tcp_port_in_use "$MTPROTO_PORT"; then
+  if docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep -q "proxy-stack-mtproto.*:${MTPROTO_PORT}->443"; then
+    info "Порт $MTPROTO_PORT похоже уже занят контейнером MTProto — продолжаем."
+  else
+    warn "Порт $MTPROTO_PORT занят (часто nginx/caddy). Переключаем MTProto на 8443."
+    MTPROTO_PORT=8443
+    if tcp_port_in_use "$MTPROTO_PORT"; then
+      die "И 8443 занят. Освободите порт или задайте MTPROTO_PORT вручную."
+    fi
+  fi
+fi
+
+# --- Секреты: при повторном запуске сохраняем MTProto secret ------------------
+MTPROTO_SECRET=""
+if [[ -r "$SECRETS_FILE" ]]; then
+  MTPROTO_SECRET="$(
+    set +u
+    # shellcheck disable=SC1090
+    source "$SECRETS_FILE"
+    printf '%s' "${MTPROTO_SECRET:-}"
+  )"
+  [[ -n "$MTPROTO_SECRET" ]] && info "Повторная установка: сохраняем существующий MTProto SECRET из secrets.env."
+fi
+if [[ -z "$MTPROTO_SECRET" ]]; then
+  MTPROTO_SECRET="$(generate_mtproto_secret)"
+fi
+
+if [[ "$ACCESS_MODE" == "basic_auth" && -z "${TINYPROXY_BASIC_AUTH_PASS:-}" ]]; then
+  TINYPROXY_BASIC_AUTH_PASS="$(generate_basic_auth_password)"
+fi
+
+if [[ "$ACCESS_MODE" == "open_warning" ]]; then
+  OPEN_PROXY_ACK=1
+else
+  OPEN_PROXY_ACK=0
+fi
+
+# --- Пакеты ------------------------------------------------------------------
+info "Установка пакетов (tinyproxy, ufw, docker, curl, openssl)…"
 apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+  ca-certificates curl openssl ufw tinyproxy iptables
 
-info "Устанавливаем зависимости..."
-apt-get install -y -qq curl wget git ufw ca-certificates gnupg lsb-release
+tinyproxy_install_package
+mtproto_install_docker
 
-# ════════════════════════════════════════════
-# 2. DOCKER
-# ════════════════════════════════════════════
-if ! command -v docker &>/dev/null; then
-    info "Устанавливаем Docker..."
-    curl -fsSL https://get.docker.com | bash -s -- -y
-    systemctl enable docker
-    systemctl start docker
-    log "Docker установлен"
+# --- Конфигурация сервисов ---------------------------------------------------
+info "Запись конфигурации Tinyproxy (режим: $ACCESS_MODE)…"
+tinyproxy_write_config "$TINYPROXY_PORT" "$ACCESS_MODE" "${ALLOW_IP_LIST[@]}"
+tinyproxy_enable_and_restart
+
+info "Запись docker-compose для MTProto (telegrammessenger/proxy)…"
+mtproto_write_compose
+mtproto_up
+
+# --- Firewall ----------------------------------------------------------------
+info "Настройка UFW (только правила с маркером proxy-stack svc=)…"
+ufw_ensure_installed
+ufw_bootstrap_if_inactive
+ufw_delete_proxy_stack_rules
+ufw_allow_mtproto_port "$MTPROTO_PORT"
+if [[ "$ACCESS_MODE" == "open_warning" ]]; then
+  ufw_allow_tinyproxy_world "$TINYPROXY_PORT"
 else
-    log "Docker уже установлен ($(docker --version | cut -d' ' -f3 | tr -d ','))"
+  ufw_allow_tinyproxy_from_ips "$TINYPROXY_PORT" "${ALLOW_IP_LIST[@]}"
+fi
+ufw_status_verbose >/dev/null
+
+# --- Сохранение секретов и сводки -------------------------------------------
+ALLOWED_IPS_CSV="$(IFS=','; echo "${ALLOW_IP_LIST[*]}")"
+export ALLOWED_IPS="$ALLOWED_IPS_CSV"
+export ACCESS_MODE SERVER_PUBLIC_IP DEFAULT_IFACE MTPROTO_SECRET MTPROTO_PORT TINYPROXY_PORT OPEN_PROXY_ACK
+write_secrets_env
+
+# --- Проверки ----------------------------------------------------------------
+TP_OK="not running"
+MP_OK="not running"
+FW_OK="not active"
+verify_tinyproxy_running && TP_OK="running" || warn "Tinyproxy не в состоянии active после restart."
+verify_tcp_port_listening "$TINYPROXY_PORT" && true || warn "Порт $TINYPROXY_PORT не слушается."
+verify_docker_mtproto_running && MP_OK="running" || warn "Контейнер MTProto не найден в docker ps."
+verify_ufw_active && FW_OK="active" || warn "UFW не active."
+
+# Ссылки MTProto (порт в ссылке обязан совпадать с опубликованным)
+ENC_HOST="$(urlencode_query "$SERVER_PUBLIC_IP")"
+TG_PROXY_URL="tg://proxy?server=${ENC_HOST}&port=${MTPROTO_PORT}&secret=${MTPROTO_SECRET}"
+HTTPS_PROXY_URL="https://t.me/proxy?server=${ENC_HOST}&port=${MTPROTO_PORT}&secret=${MTPROTO_SECRET}"
+
+BROWSER_HINT="HTTP-прокси: ${SERVER_PUBLIC_IP}:${TINYPROXY_PORT} (тип HTTP, не SOCKS)."
+if [[ "$ACCESS_MODE" == "basic_auth" ]]; then
+  BROWSER_HINT="${BROWSER_HINT} Логин/пароль: ${TINYPROXY_BASIC_AUTH_USER} / ${TINYPROXY_BASIC_AUTH_PASS} (если браузер спрашивает)."
 fi
 
-if ! command -v docker-compose &>/dev/null && ! docker compose version &>/dev/null 2>&1; then
-    info "Устанавливаем docker-compose..."
-    apt-get install -y -qq docker-compose-plugin || \
-        curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m)" \
-             -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose
-fi
+umask 077
+cat >"$SUMMARY_FILE" <<EOF
+═══════════════════════════════════════════════════════════════════
+ proxy-stack — сводка подключения
+ Сгенерировано: $(date -Iseconds 2>/dev/null || date)
+═══════════════════════════════════════════════════════════════════
 
-# ════════════════════════════════════════════
-# 3. КОНФИГИ
-# ════════════════════════════════════════════
-info "Генерируем конфиги..."
+[ Tinyproxy ]
+  Host:           ${SERVER_PUBLIC_IP}
+  Port:           ${TINYPROXY_PORT}
+  Access mode:    ${ACCESS_MODE}
+  Allowed IPs:    ${ALLOWED_IPS_CSV}
+  Browser setup:  ${BROWSER_HINT}
 
-# ── Dante SOCKS5 ──────────────────────────
-mkdir -p "$INSTALL_DIR/dante"
+[ MTProto ]
+  Server:         ${SERVER_PUBLIC_IP}
+  Port:           ${MTPROTO_PORT}
+  Secret:         ${MTPROTO_SECRET}
+  tg://proxy:     ${TG_PROXY_URL}
+  https://t.me:   ${HTTPS_PROXY_URL}
 
-cat > "$INSTALL_DIR/dante/danted.conf" <<EOF
-logoutput: stderr
-internal: 0.0.0.0 port = $SOCKS_PORT
-external: $IFACE
+[ Files ]
+  Secrets file:    ${SECRETS_FILE}
+  Install log:     ${INSTALL_LOG}
+  Summary:         ${SUMMARY_FILE}
 
-socksmethod: username
-user.privileged: root
-user.notprivileged: nobody
+[ Status ]
+  Tinyproxy:      ${TP_OK}
+  MTProto:        ${MP_OK}
+  Firewall:       ${FW_OK}
 
-client pass {
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    log: error
-}
-
-socks pass {
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    socksmethod: username
-    log: error
-}
+═══════════════════════════════════════════════════════════════════
 EOF
-
-cat > "$INSTALL_DIR/dante/Dockerfile" <<'EOF'
-FROM ubuntu:22.04
-RUN apt-get update -qq && apt-get install -y -qq dante-server && rm -rf /var/lib/apt/lists/*
-COPY danted.conf /etc/danted.conf
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-EXPOSE 1080
-ENTRYPOINT ["/entrypoint.sh"]
-EOF
-
-cat > "$INSTALL_DIR/dante/entrypoint.sh" <<'EOSH'
-#!/bin/bash
-# Создаём пользователя для SOCKS5
-USER="${SOCKS_USER:-proxyuser}"
-PASS="${SOCKS_PASS:-changeme}"
-id "$USER" &>/dev/null || useradd -M -s /usr/sbin/nologin "$USER"
-echo "$USER:$PASS" | chpasswd
-exec danted -f /etc/danted.conf
-EOSH
-chmod +x "$INSTALL_DIR/dante/entrypoint.sh"
-
-# ── Tinyproxy HTTP ────────────────────────
-mkdir -p "$INSTALL_DIR/tinyproxy"
-
-cat > "$INSTALL_DIR/tinyproxy/tinyproxy.conf" <<EOF
-Port $HTTP_PORT
-Listen 0.0.0.0
-Timeout 600
-DefaultErrorFile "/usr/share/tinyproxy/default.html"
-StatFile "/usr/share/tinyproxy/stats.html"
-LogLevel Info
-MaxClients 100
-MinSpareServers 5
-MaxSpareServers 20
-StartServers 10
-MaxRequestsPerChild 0
-Allow 0.0.0.0/0
-ViaProxyName "tinyproxy"
-EOF
-
-# ── docker-compose.yml ────────────────────
-cat > "$INSTALL_DIR/docker-compose.yml" <<EOF
-version: '3.8'
-
-services:
-  dante:
-    build: ./dante
-    container_name: dante-socks5
-    restart: unless-stopped
-    ports:
-      - "${SOCKS_PORT}:${SOCKS_PORT}"
-    environment:
-      - SOCKS_USER=${SOCKS_USER}
-      - SOCKS_PASS=${SOCKS_PASS}
-
-  tinyproxy:
-    image: vimagick/tinyproxy
-    container_name: tinyproxy-http
-    restart: unless-stopped
-    ports:
-      - "${HTTP_PORT}:${HTTP_PORT}"
-    volumes:
-      - ./tinyproxy/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
-EOF
-
-log "Конфиги созданы"
-
-# ════════════════════════════════════════════
-# 4. ЗАПУСК ПРОКСИ (Docker Compose)
-# ════════════════════════════════════════════
-info "Собираем и запускаем контейнеры прокси..."
-cd "$INSTALL_DIR"
-
-if docker compose version &>/dev/null 2>&1; then
-    docker compose up -d --build
-else
-    docker-compose up -d --build
-fi
-
-log "Прокси запущены"
-
-# ════════════════════════════════════════════
-# 5. OUTLINE VPN
-# ════════════════════════════════════════════
-info "Устанавливаем Outline VPN..."
-mkdir -p "$OUTLINE_DIR"
-
-if [[ -f "$OUTLINE_DIR/access.txt" ]]; then
-    warn "Outline уже установлен, пропускаем..."
-else
-    bash -c "$(wget -qO- https://raw.githubusercontent.com/Jigsaw-Code/outline-server/master/src/server_manager/install_scripts/install_server.sh)" \
-        install_server.sh --keys-port=9999 2>&1 | tee /tmp/outline_install.log
-
-    # Извлекаем данные подключения
-    OUTLINE_API=$(grep "apiUrl" /tmp/outline_install.log | grep -o '"apiUrl":"[^"]*"' | cut -d'"' -f4)
-    OUTLINE_CERT=$(grep "certSha256" /tmp/outline_install.log | grep -o '"certSha256":"[^"]*"' | cut -d'"' -f4)
-
-    cat > "$OUTLINE_DIR/access.txt" <<EOF
-{
-  "apiUrl": "${OUTLINE_API}",
-  "certSha256": "${OUTLINE_CERT}"
-}
-EOF
-    log "Outline VPN установлен"
-fi
-
-# ════════════════════════════════════════════
-# 6. ФАЙРВОЛ (UFW)
-# ════════════════════════════════════════════
-info "Настраиваем файрвол..."
-ufw --force reset >/dev/null 2>&1
-ufw default deny incoming >/dev/null 2>&1
-ufw default allow outgoing >/dev/null 2>&1
-ufw allow 22/tcp    >/dev/null 2>&1  # SSH
-ufw allow "$SOCKS_PORT/tcp" >/dev/null 2>&1
-ufw allow "$HTTP_PORT/tcp"  >/dev/null 2>&1
-ufw allow 9999/tcp  >/dev/null 2>&1  # Outline keys port
-ufw allow 443/tcp   >/dev/null 2>&1  # Outline HTTPS
-ufw --force enable  >/dev/null 2>&1
-log "Файрвол настроен"
-
-# ════════════════════════════════════════════
-# 7. СОХРАНЯЕМ SUMMARY
-# ════════════════════════════════════════════
-SUMMARY_FILE="$INSTALL_DIR/access-summary.txt"
-
-cat > "$SUMMARY_FILE" <<EOF
-════════════════════════════════════════════════
-  proxy-stack — данные для подключения
-  Сервер: $SERVER_IP
-  Дата:   $(date '+%Y-%m-%d %H:%M:%S')
-════════════════════════════════════════════════
-
-SOCKS5 прокси (Dante):
-  Хост:     $SERVER_IP
-  Порт:     $SOCKS_PORT
-  Логин:    $SOCKS_USER
-  Пароль:   $SOCKS_PASS
-
-HTTP прокси (Tinyproxy):
-  Хост:     $SERVER_IP
-  Порт:     $HTTP_PORT
-  (без аутентификации, можно добавить BasicAuth)
-
-Outline VPN:
-  Управление: Outline Manager → вставь содержимое /opt/outline/access.txt
-  Файл:        $OUTLINE_DIR/access.txt
-
-════════════════════════════════════════════════
-EOF
-
 chmod 600 "$SUMMARY_FILE"
 
-# ════════════════════════════════════════════
-# 8. ИТОГОВЫЙ ВЫВОД
-# ════════════════════════════════════════════
+# --- Вывод для оператора -----------------------------------------------------
 echo ""
-echo -e "${BOLD}${GREEN}════════════════════════════════════════════${NC}"
-echo -e "${BOLD}${GREEN}   УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО              ${NC}"
-echo -e "${BOLD}${GREEN}════════════════════════════════════════════${NC}"
-echo ""
+echo -e "${BOLD}═══════════════════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD} proxy-stack — установка завершена${NC}"
+echo -e "${BOLD}═══════════════════════════════════════════════════════════════════${NC}"
 cat "$SUMMARY_FILE"
 echo ""
-echo -e "${CYAN}Данные сохранены в: ${BOLD}$SUMMARY_FILE${NC}"
-echo ""
-
-# Проверка статуса контейнеров
-info "Статус контейнеров:"
-docker ps --format "  {{.Names}}\t{{.Status}}\t{{.Ports}}"
-echo ""
-log "Готово! 🚀"
+log "Готово. Полная сводка: $SUMMARY_FILE"
