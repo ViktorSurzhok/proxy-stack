@@ -34,7 +34,14 @@ require_root() {
 }
 
 load_os_release() {
-  [[ -r /etc/os-release ]] || die "Не найден /etc/os-release"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    die "Этот установщик только для Linux (Ubuntu/Debian на VPS). На macOS его запускать не нужно: \
+установка выполняется на удалённом сервере по SSH. Пример: ssh root@ВАШ_VPS, затем git clone … && sudo ALLOWED_IPS=… ./install.sh"
+  fi
+  if [[ ! -r /etc/os-release ]]; then
+    die "Не найден /etc/os-release — похоже, это не типичный Linux (Ubuntu/Debian). \
+proxy-stack ставится на VPS с Ubuntu или Debian, не на macOS/Windows."
+  fi
   # shellcheck source=/dev/null
   . /etc/os-release
 }
